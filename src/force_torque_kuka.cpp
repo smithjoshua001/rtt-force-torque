@@ -7,45 +7,52 @@
 #include <force_torque_comedi_ati.hpp>
 #include <rtt/Component.hpp>
 
-FTComAti::FTComAti(std::string const & name) :
+FTKuka::FTKuka(std::string const & name) :
 		RTT::TaskContext(name) {
 	// constructor:
-	subdev = 0;
-	chan.resize(6);
-	chan.setLinSpaced(6, 0, 5);
-	range = 0;
-	aref = AREF_DIFF;
+	
 }
 
-bool FTComAti::configureHook() {
+bool FTKuka::configureHook() {
 	// intializations and object creations go here. Each component should run this before being able to run
-	dev = comedi_open("/dev/comedi0"); //may need to be changed
-	if (dev == NULL) {
-		comedi_perror("comedi_open");
-		return false;
-	}
+	in_ext_torques_port.setName("in_ext_torques");
+	in_ext_torques_flow = RTT::NoData;
+	ports()->addPort(in_ext_torques_port);
+	in_robot_status_port.setName("in_robot_status");
+	in_robot_status_flow = RTT::NoData;
+	ports()->addPort(in_robot_status_port);
+	wrench_port.setName("out_wrench");
+	wrench_data = rstrt::dynamics::Wrench();
+	wrench_data.force.setZero();
+	wrench_data.torque.setZero();
+	wrench_port.setDataSample(wrench_data);
+	ports()->addPort(wrench_port);
+	
 	return true;
 }
 
-bool FTComAti::startHook() {
+bool FTKuka::startHook() {
 	// this method starts the component
 	return true;
 }
 
-void FTComAti::updateHook() {
-	// this is the actual body of a component. it is called on each cycle
-	for (i = 0; i < 6; i++) {
-		retval = comedi_data_read(dev, subdev, chan[i], range, aref, &data);
-		if (retval < 0) {
-			comedi_perror("comedi_data_read");
-			return;
-		}
-		comedi_set_global_oor_behavior (COMEDI_OOR_NAN);
-		range_info = comedi_get_range(dev, subdev, chan[i], range);
-		maxdata = comedi_get_maxdata(dev, subdev, chan[i]);
-		voltage_data[i] = comedi_to_phys(data, range_info, maxdata);
+void FTKuka::updateHook() {
+	in_robot_status_flow = in_robot_status_port.read(in_robot_status_var);
+	in_ext_torques_flow = in_ext_torques_port.read(in_ext_torques_var);
+	if(in_robot_status_flow==RTT::NoData||in_ext_torques_flow==RTT::NoData){
+		return;
 	}
-	RTT::log(RTT::Error)<<voltage_data<<RTT::endlog();
+
+	kdl_jointstate.q.data = in_robot_status_var.angles.cast<double>();
+	jnt_to_jac_solver->JntToJac(kdl_jointstate.q,jac_kdl,armChain_KDL.getNrOfSegments());
+	jac = jac_kdl.data.cast<float>().transpose();
+	F = jac.transpose*(jac*jac.transpose()).inverse()*in_ext_torques_var.torques;
+	wrench_data.forces = F.head<3>();
+	wrench_data.torques = F.tail<3>();
+	wrench_port.write(wrench_data);
+	
+	// this is the actual body of a component. it is called on each cycle
+	
 	/*
 	wrench_data.forces= tip_ft_rotation*wrench_data.forces;
 	wrench_data.torques= tip_ft_rotation*wrench_data.torques + tip_ft_translation.cross(wrench_data.forces);
@@ -53,15 +60,14 @@ void FTComAti::updateHook() {
 
 }
 
-void FTComAti::stopHook() {
+void FTKuka::stopHook() {
 	// stops the component (update hook wont be  called anymore)
 }
 
-void FTComAti::cleanupHook() {
-	free(chan);
+void FTKuka::cleanupHook() {
 	// cleaning the component data
 }
-bool FTComAti::loadURDFAndSRDF(const std::string &URDF_path,
+bool FTKuka::loadURDFAndSRDF(const std::string &URDF_path,
 		const std::string &SRDF_path) {
 	if (!_models_loaded) {
 		std::string _urdf_path = URDF_path;
@@ -109,8 +115,30 @@ bool FTComAti::loadURDFAndSRDF(const std::string &URDF_path,
 		}
 		tip_ft_rotation = Eigen::Map<Eigen::Matrix3d>(tip_ft_frame.M.data).cast<float>();
 		tip_ft_translation = Eigen::Map<Eigen::Vector3d>(tip_ft_frame.p.data).cast<float>();
-		
-		
+		if (!p.initTreeAndChainFromURDFString(xml_model, base_name, end_eff_name,
+			robot_tree2,armChain_KDL)) {
+			RTT::log(RTT::Error) << "[ DLW " << this->getName()
+				<< "] URDF could not be parsed !" << RTT::endlog();
+
+			// TODO add proper error handling!
+			return false;
+		}
+		jnt_to_jac_solver.reset(new KDL::ChainJntToJacSolver(armChain_KDL));
+		int DOF = armChain_KDL.getNrOfJoints();
+                in_robot_status_var.angles.resize(DOF);
+		in_robot_status_var.velocities.resize(DOF);
+		in_robot_status_var.torques.resize(DOF);
+		in_robot_status_var.angles.setZero();
+		in_robot_status_var.velocities.setZero();
+		in_robot_status_var.torques.setZero();
+				
+		jac_kdl.resize(DOF);
+                jac.resize(DOF,6);
+		in_ext_torques_var.torques.resize(DOF);
+		in_ext_torques_var.torques.setZero();
+		F.resize(6);
+		F.setZero();
+
 	} else
 		RTT::log(RTT::Info) << "URDF and SRDF have been already loaded!"
 				<< RTT::endlog();
@@ -118,10 +146,14 @@ bool FTComAti::loadURDFAndSRDF(const std::string &URDF_path,
 	return _models_loaded;
 }
 
-void FTComAti::setFTandTip(std::string ft_name,std::string tip_name){
+void FTKuka::setFTandTip(std::string ft_name,std::string tip_name){
 	this->ft_name = ft_name;
 	this->tip_name = tip_name;
 }
+void FTKuka::setBaseandEndEff(std::string base, std::string endeff){
+	base_name = base;
+	end_eff_name = endeff;
+}
 
 // This macro, as you can see, creates the component. Every component should have this!
-ORO_CREATE_COMPONENT_LIBRARY()ORO_LIST_COMPONENT_TYPE(FTComAti)
+ORO_CREATE_COMPONENT_LIBRARY()ORO_LIST_COMPONENT_TYPE(FTKuka)
